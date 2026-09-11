@@ -1,5 +1,6 @@
 import mysql from "mysql2/promise";
 import { createHash, randomBytes } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 export const hash = (value) => createHash("sha256").update(value).digest("hex");
 export const secret = () => randomBytes(32).toString("base64url");
 export const iso = (value) =>
@@ -161,6 +162,51 @@ export class Store {
         sqlDate(now),
       ],
     );
+  }
+  async upsertMany(specs, source, now = new Date()) {
+    if (!specs.length) return 0;
+    const existing = new Map(
+      (
+        await this.query(
+          "SELECT id,spec,source,archived FROM components WHERE id IN (?)",
+          [specs.map((spec) => spec.id)],
+        )
+      ).map((row) => [row.id, row]),
+    );
+    // MySQL JSON key order differs from the input order. Compare parsed values,
+    // and leave administrative overrides and component ownership untouched.
+    const changed = specs.filter((spec) => {
+      const row = existing.get(spec.id);
+      return (
+        !row ||
+        (row.source === source &&
+          (row.archived ||
+            !isDeepStrictEqual(
+              json(row.spec),
+              JSON.parse(JSON.stringify(spec)),
+            )))
+      );
+    });
+    for (let offset = 0; offset < changed.length; offset += 100) {
+      const batch = changed.slice(offset, offset + 100);
+      await this.query(
+        `INSERT INTO components (id,spec,overrides,source,created_at,updated_at,last_seen)
+        VALUES ? ON DUPLICATE KEY UPDATE spec=IF(source=VALUES(source),VALUES(spec),spec),
+        last_seen=IF(source=VALUES(source),VALUES(last_seen),last_seen), archived=IF(source=VALUES(source),FALSE,archived)`,
+        [
+          batch.map((spec) => [
+            spec.id,
+            JSON.stringify(spec),
+            "{}",
+            source,
+            sqlDate(now),
+            sqlDate(now),
+            sqlDate(now),
+          ]),
+        ],
+      );
+    }
+    return changed.length;
   }
   async rate(key, limit, seconds) {
     return this.transaction(async (db) => {

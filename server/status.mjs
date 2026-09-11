@@ -60,124 +60,147 @@ export function nextState(previous, result, now) {
   };
 }
 export async function recordObservation(store, id, result, now = new Date()) {
-  return store.transaction(async (db) => {
-    const previous = await store.component(id, db, true);
-    if (!previous || previous.archived) return;
-    const state = nextState(previous, result, now);
-    const at = sqlDate(now);
-    await store.query(
-      "INSERT INTO component_evidence (component_id,payload,updated_at) VALUES (?,?,?) ON DUPLICATE KEY UPDATE payload=VALUES(payload),updated_at=VALUES(updated_at)",
-      [id, JSON.stringify(result.evidence || null), at],
-      db,
-    );
-    await store.query(
-      "UPDATE components SET status=?,raw_status=?,streak=?,checked_at=?,latency_ms=?,reason=? WHERE id=?",
-      [
-        state.status,
-        result.status,
-        state.streak,
-        at,
-        result.latencyMs ?? null,
-        (result.reason || "").slice(0, 255),
+  return store.transaction((db) =>
+    writeObservation(store, db, id, result, now),
+  );
+}
+export async function recordObservations(store, observations, batchSize = 25) {
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 100)
+    throw new Error("Invalid observation batch size");
+  // Probes finish before entering a transaction. A stable lock order and bounded
+  // batches keep API edits responsive while amortizing durable commits.
+  const ordered = [...observations].sort((a, b) => a.id.localeCompare(b.id));
+  for (let offset = 0; offset < ordered.length; offset += batchSize) {
+    await store.transaction(async (db) => {
+      for (const {
         id,
-      ],
-      db,
-    );
+        result,
+        now = new Date(),
+        seen = false,
+      } of ordered.slice(offset, offset + batchSize))
+        await writeObservation(store, db, id, result, now, seen);
+    });
+  }
+}
+async function writeObservation(store, db, id, result, now, seen = false) {
+  const previous = await store.component(id, db, true);
+  if (!previous || previous.archived) return;
+  const state = nextState(previous, result, now);
+  const at = sqlDate(now);
+  await store.query(
+    "INSERT INTO component_evidence (component_id,payload,updated_at) VALUES (?,?,?) ON DUPLICATE KEY UPDATE payload=VALUES(payload),updated_at=VALUES(updated_at)",
+    [id, JSON.stringify(result.evidence || null), at],
+    db,
+  );
+  await store.query(
+    "UPDATE components SET status=?,raw_status=?,streak=?,checked_at=?,latency_ms=?,reason=?,last_seen=IF(?, ?, last_seen) WHERE id=?",
+    [
+      state.status,
+      result.status,
+      state.streak,
+      at,
+      result.latencyMs ?? null,
+      (result.reason || "").slice(0, 255),
+      seen,
+      at,
+      id,
+    ],
+    db,
+  );
+  await store.query(
+    "INSERT INTO observations (component_id,checked_at,status,raw_status,latency_ms,reason) VALUES (?,?,?,?,?,?)",
+    [
+      id,
+      at,
+      state.status,
+      result.status,
+      result.latencyMs ?? null,
+      (result.reason || "").slice(0, 255),
+    ],
+    db,
+  );
+  const [period] = await store.query(
+    "SELECT * FROM periods WHERE component_id=? ORDER BY ended_at DESC,id DESC LIMIT 1",
+    [id],
+    db,
+  );
+  if (period && period.status === state.status && state.continuous) {
     await store.query(
-      "INSERT INTO observations (component_id,checked_at,status,raw_status,latency_ms,reason) VALUES (?,?,?,?,?,?)",
-      [
-        id,
-        at,
-        state.status,
-        result.status,
-        result.latencyMs ?? null,
-        (result.reason || "").slice(0, 255),
-      ],
+      "UPDATE periods SET ended_at=? WHERE id=?",
+      [at, period.id],
       db,
     );
-    const [period] = await store.query(
-      "SELECT * FROM periods WHERE component_id=? ORDER BY ended_at DESC,id DESC LIMIT 1",
-      [id],
-      db,
-    );
-    if (period && period.status === state.status && state.continuous) {
+  } else {
+    if (period && state.continuous)
       await store.query(
         "UPDATE periods SET ended_at=? WHERE id=?",
         [at, period.id],
         db,
       );
-    } else {
-      if (period && state.continuous)
-        await store.query(
-          "UPDATE periods SET ended_at=? WHERE id=?",
-          [at, period.id],
-          db,
-        );
+    await store.query(
+      "INSERT INTO periods (component_id,status,started_at,ended_at) VALUES (?,?,?,?)",
+      [id, state.status, at, at],
+      db,
+    );
+  }
+  if (previous.incidentGroup) return state;
+  if (failed(state.status)) {
+    const [incident] = await store.query(
+      "SELECT id FROM incidents WHERE automatic_key=?",
+      [id],
+      db,
+    );
+    if (!incident) {
+      const incidentId = randomUUID();
       await store.query(
-        "INSERT INTO periods (component_id,status,started_at,ended_at) VALUES (?,?,?,?)",
-        [id, state.status, at, at],
-        db,
-      );
-    }
-    if (previous.incidentGroup) return state;
-    if (failed(state.status)) {
-      const [incident] = await store.query(
-        "SELECT id FROM incidents WHERE automatic_key=?",
-        [id],
-        db,
-      );
-      if (!incident) {
-        const incidentId = randomUUID();
-        await store.query(
-          `INSERT INTO incidents (id,title,message,component_ids,severity,phase,source,automatic_key,started_at,updated_at) VALUES (?,?,?,?,?,'investigating','monitor',?,?,?)`,
-          [
-            incidentId,
-            `${previous.groupName || previous.group} · ${previous.name} 服务异常`.slice(
-              0,
-              200,
-            ),
-            "监测发现服务异常，正在确认影响。",
-            JSON.stringify([id]),
-            state.status,
-            id,
-            at,
-            at,
-          ],
-          db,
-        );
-        await appendUpdate(
-          store,
-          db,
+        `INSERT INTO incidents (id,title,message,component_ids,severity,phase,source,automatic_key,started_at,updated_at) VALUES (?,?,?,?,?,'investigating','monitor',?,?,?)`,
+        [
           incidentId,
-          "investigating",
+          `${previous.groupName || previous.group} · ${previous.name} 服务异常`.slice(
+            0,
+            200,
+          ),
           "监测发现服务异常，正在确认影响。",
+          JSON.stringify([id]),
+          state.status,
+          id,
           at,
-        );
-      }
-    } else if (state.status === "operational") {
-      const [incident] = await store.query(
-        "SELECT id FROM incidents WHERE automatic_key=?",
-        [id],
+          at,
+        ],
         db,
       );
-      if (incident) {
-        await store.query(
-          "UPDATE incidents SET phase='resolved', message='连续监测确认服务已恢复。', resolved_at=?,updated_at=?,automatic_key=NULL,version=version+1 WHERE id=?",
-          [at, at, incident.id],
-          db,
-        );
-        await appendUpdate(
-          store,
-          db,
-          incident.id,
-          "resolved",
-          "连续监测确认服务已恢复。",
-          at,
-        );
-      }
+      await appendUpdate(
+        store,
+        db,
+        incidentId,
+        "investigating",
+        "监测发现服务异常，正在确认影响。",
+        at,
+      );
     }
-    return state;
-  });
+  } else if (state.status === "operational") {
+    const [incident] = await store.query(
+      "SELECT id FROM incidents WHERE automatic_key=?",
+      [id],
+      db,
+    );
+    if (incident) {
+      await store.query(
+        "UPDATE incidents SET phase='resolved', message='连续监测确认服务已恢复。', resolved_at=?,updated_at=?,automatic_key=NULL,version=version+1 WHERE id=?",
+        [at, at, incident.id],
+        db,
+      );
+      await appendUpdate(
+        store,
+        db,
+        incident.id,
+        "resolved",
+        "连续监测确认服务已恢复。",
+        at,
+      );
+    }
+  }
+  return state;
 }
 export async function reconcileGroupedIncidents(store, now = new Date()) {
   const components = await store.components();
