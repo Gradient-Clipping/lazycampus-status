@@ -4,7 +4,10 @@ import { randomInt, randomUUID } from "node:crypto";
 import { Store, hash } from "../server/store.mjs";
 import { settings } from "../server/config.mjs";
 import { createApp } from "../server/app.mjs";
-import { recordObservation } from "../server/status.mjs";
+import {
+  recordObservation,
+  reconcileGroupedIncidents,
+} from "../server/status.mjs";
 test(
   "MySQL-backed monitoring, scoped API, incident lifecycle and verified subscriptions",
   { skip: process.env.STATUS_TEST_MYSQL !== "1" },
@@ -462,6 +465,106 @@ test(
             (await inject("GET", "/readyz", undefined, {})).statusCode,
             200,
           );
+        },
+      );
+      await t.test(
+        "incident publication is idempotent and rejects conflicting replay",
+        async () => {
+          const body = {
+            title: "Idempotent incident",
+            message: "Test update",
+            componentIds: [id],
+            severity: "partial_outage",
+          };
+          const keyed = { ...headers, "idempotency-key": prefix + "-event" };
+          const first = await inject(
+            "POST",
+            "/api/v1/admin/incidents",
+            body,
+            keyed,
+          );
+          const second = await inject(
+            "POST",
+            "/api/v1/admin/incidents",
+            body,
+            keyed,
+          );
+          assert.equal(first.statusCode, 201);
+          assert.deepEqual(second.json(), first.json());
+          const conflict = await inject(
+            "POST",
+            "/api/v1/admin/incidents",
+            { ...body, message: "different" },
+            keyed,
+          );
+          assert.equal(conflict.statusCode, 409);
+          const [count] = await store.query(
+            "SELECT COUNT(*) n FROM incident_updates WHERE incident_id=?",
+            [first.json().id],
+          );
+          assert.equal(Number(count.n), 1);
+        },
+      );
+      await t.test(
+        "related failures share one incident and missing evidence never resolves it",
+        async () => {
+          const ids = [prefix + "-group-a", prefix + "-group-b"];
+          const at = new Date();
+          for (const key of ids) {
+            await store.upsert(
+              {
+                id: key,
+                name: key,
+                group: prefix,
+                incidentGroup: prefix,
+                public: true,
+                kind: "heartbeat",
+                failureThreshold: 1,
+                recoveryThreshold: 1,
+              },
+              "manual",
+            );
+            await recordObservation(store, key, { status: "full_outage" }, at);
+          }
+          await reconcileGroupedIncidents(store, at);
+          await reconcileGroupedIncidents(store, at);
+          const rows = await store.query(
+            "SELECT * FROM incidents WHERE automatic_key=?",
+            ["group:" + prefix],
+          );
+          assert.equal(rows.length, 1);
+          assert.deepEqual(
+            typeof rows[0].component_ids === "string"
+              ? JSON.parse(rows[0].component_ids)
+              : rows[0].component_ids,
+            ids,
+          );
+          await recordObservation(store, ids[0], { status: "operational" }, at);
+          await recordObservation(store, ids[1], { status: "no_data" }, at);
+          await reconcileGroupedIncidents(store, at);
+          assert.equal(
+            (
+              await store.query("SELECT phase FROM incidents WHERE id=?", [
+                rows[0].id,
+              ])
+            )[0].phase,
+            "investigating",
+          );
+          await recordObservation(store, ids[1], { status: "operational" }, at);
+          await reconcileGroupedIncidents(store, at);
+          assert.equal(
+            (
+              await store.query("SELECT phase FROM incidents WHERE id=?", [
+                rows[0].id,
+              ])
+            )[0].phase,
+            "resolved",
+          );
+          await store.query(
+            "DELETE FROM incident_updates WHERE incident_id=?",
+            [rows[0].id],
+          );
+          await store.query("DELETE FROM incidents WHERE id=?", [rows[0].id]);
         },
       );
     } finally {

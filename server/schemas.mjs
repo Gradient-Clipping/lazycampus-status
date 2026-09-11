@@ -15,6 +15,7 @@ const daily = {
     date: { type: "string", format: "date" },
     status,
     uptimePercentage: { type: "number", nullable: true },
+    availabilityPercentage: { type: "number", nullable: true },
     observedSeconds: { type: "integer" },
     maintenanceSeconds: { type: "integer" },
     coveragePercentage: { type: "number" },
@@ -23,6 +24,8 @@ const daily = {
 const stats = {
   history: { type: "array", items: daily },
   uptimePercentage: { type: "string", nullable: true },
+  availabilityPercentage: { type: "string", nullable: true },
+  coveragePercentage: { type: "number" },
   observedSeconds: { type: "integer" },
 };
 const component = {
@@ -35,8 +38,22 @@ const component = {
     status,
     checkedAt: instant,
     latencyMs: { type: "integer", nullable: true },
+    latencyCompliancePercentage: { type: "number", nullable: true },
     kind: text,
     url: text,
+    evidence: {
+      type: "object",
+      nullable: true,
+      properties: {
+        observedAt: instant,
+        requests: { type: "integer" },
+        errors: { type: "integer" },
+        limited: { type: "integer" },
+        p95Ms: { type: "integer" },
+        windowSeconds: { type: "integer" },
+        successPercentage: { type: "number" },
+      },
+    },
     ...stats,
   },
 };

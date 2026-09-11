@@ -88,6 +88,18 @@ export function Admin({ navigate }) {
             <span>最近监测 {formatInstant(data.lastRun)}</span>
             <span>{data.components.length} 个监测组件</span>
             <span>{data.storageError ? "存储异常" : "存储正常"}</span>
+            <span>采集耗时 {data.cycleDurationMs ?? "—"} ms</span>
+            <span>
+              邮件任务{" "}
+              {data.lastMailError ? "异常" : formatInstant(data.lastMailRun)}
+            </span>
+            <span>
+              待处理投递{" "}
+              {data.attention?.reduce(
+                (sum, item) => sum + Number(item.count),
+                0,
+              ) || 0}
+            </span>
           </div>
           <nav className="tabs" aria-label="管理栏目">
             {[
@@ -355,6 +367,51 @@ function Service({ component: c, action, busy }) {
               </div>
             ) : null}
           </dl>
+          {c.kind !== "kubernetes" ? (
+            <form
+              className="admin-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                const values = new FormData(event.currentTarget);
+                patch(
+                  Object.fromEntries(
+                    [
+                      "intervalSeconds",
+                      "timeoutSeconds",
+                      "failureThreshold",
+                      "recoveryThreshold",
+                      "degradedAfterMs",
+                    ].map((key) => [key, Number(values.get(key))]),
+                  ),
+                );
+              }}
+            >
+              <div className="form-grid">
+                {[
+                  ["intervalSeconds", "检查间隔（秒）", 30, 3600, 30],
+                  ["timeoutSeconds", "超时（秒）", 1, 15, 5],
+                  ["failureThreshold", "异常确认次数", 1, 10, 3],
+                  ["recoveryThreshold", "恢复确认次数", 1, 10, 2],
+                  ["degradedAfterMs", "响应阈值（毫秒）", 100, 15000, 3000],
+                ].map(([key, label, min, max, fallback]) => (
+                  <label key={key}>
+                    {label}
+                    <input
+                      name={key}
+                      type="number"
+                      min={min}
+                      max={max}
+                      defaultValue={c[key] || fallback}
+                      required
+                    />
+                  </label>
+                ))}
+              </div>
+              <button className="secondary-button" disabled={busy}>
+                保存监测设置
+              </button>
+            </form>
+          ) : null}
           <div className="admin-toolbar">
             <button
               className="secondary-button"

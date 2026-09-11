@@ -1,9 +1,15 @@
 import { readCatalog } from "./config.mjs";
 import { clusterSnapshot, discover } from "./kubernetes.mjs";
 import { probe, validateTarget } from "./probes.mjs";
-import { appendUpdate, effectiveStatus, recordObservation } from "./status.mjs";
+import {
+  appendUpdate,
+  effectiveStatus,
+  recordObservation,
+  reconcileGroupedIncidents,
+} from "./status.mjs";
 import { sqlDate } from "./store.mjs";
 import { deliverEmails } from "./subscriptions.mjs";
+import { dependencyResult } from "./evidence.mjs";
 
 export class Monitor {
   constructor(store, config, snapshots, logger) {
@@ -19,6 +25,10 @@ export class Monitor {
     this.lastClusterSuccess = null;
     this.lastCleanup = 0;
     this.stopping = false;
+    this.nextDue = new Map();
+    this.lastMailRun = null;
+    this.lastMailError = null;
+    this.cycleDurationMs = null;
   }
   async cycle() {
     if (this.running) return this.running;
@@ -26,6 +36,11 @@ export class Monitor {
       .locked("lazycampus-status-monitor-v1", async () => {
         const now = new Date(),
           catalog = await readCatalog(this.config.configFile);
+        const started = Date.now();
+        const context = {
+          credentials: this.config.probeCredentials,
+          cache: new Map(),
+        };
         const groups = catalog.groups || [];
         for (const spec of catalog.monitors) {
           validateTarget(spec, this.config.probeHosts);
@@ -104,9 +119,7 @@ export class Monitor {
         const manual = components.filter(
           (c) =>
             c.kind !== "kubernetes" &&
-            (!c.checkedAt ||
-              now - new Date(c.checkedAt) >=
-                (c.intervalSeconds || 30) * 1000 - 1000),
+            (!this.nextDue.has(c.id) || +now >= this.nextDue.get(c.id)),
         );
         // A bounded pool avoids overlapping scheduled requests and uncontrolled fan-out.
         let next = 0;
@@ -114,42 +127,27 @@ export class Monitor {
           Array.from({ length: Math.min(4, manual.length) }, async () => {
             while (next < manual.length) {
               const component = manual[next++];
+              this.nextDue.set(
+                component.id,
+                +now + (component.intervalSeconds || 30) * 1000 - 500,
+              );
               const maintenance = await this.store.query(
                 "SELECT id FROM incidents WHERE phase='in_progress' AND JSON_CONTAINS(component_ids,JSON_QUOTE(?)) LIMIT 1",
                 [component.id],
               );
-              const result = maintenance.length
+              let result = maintenance.length
                 ? { status: "maintenance", reason: "计划维护中" }
-                : await probe(component, this.config.probeHosts, now);
+                : await probe(component, this.config.probeHosts, now, context);
               if (
                 !maintenance.length &&
                 !component.paused &&
-                result.status === "operational"
+                ["operational", "degraded_performance"].includes(result.status)
               ) {
-                const states = (component.dependencies || []).map((id) =>
-                  byId.has(id)
-                    ? effectiveStatus(byId.get(id), now, this.config.staleAfter)
+                result = dependencyResult(component, result, byId, (c) =>
+                  c
+                    ? effectiveStatus(c, now, this.config.staleAfter)
                     : "no_data",
                 );
-                if (
-                  states.some((s) =>
-                    ["partial_outage", "full_outage"].includes(s),
-                  )
-                )
-                  Object.assign(result, {
-                    status: "partial_outage",
-                    reason: "关联服务未就绪",
-                  });
-                else if (states.some((s) => s === "degraded_performance"))
-                  Object.assign(result, {
-                    status: "degraded_performance",
-                    reason: "关联服务性能下降",
-                  });
-                else if (states.some((s) => s === "no_data"))
-                  Object.assign(result, {
-                    status: "no_data",
-                    reason: "关联服务状态待确认",
-                  });
               }
               await recordObservation(
                 this.store,
@@ -160,11 +158,13 @@ export class Monitor {
             }
           }),
         );
+        await reconcileGroupedIncidents(this.store);
         if (Date.now() - this.lastCleanup > 3600000) {
           await this.cleanup();
           this.lastCleanup = Date.now();
         }
         this.lastRun = new Date().toISOString();
+        this.cycleDurationMs = Date.now() - started;
       })
       .catch(() =>
         this.logger.error(
@@ -220,6 +220,11 @@ export class Monitor {
       ["rate_limits", "expires_at<UTC_TIMESTAMP()"],
       ["sessions", "expires_at<UTC_TIMESTAMP()"],
       ["audit", "created_at<DATE_SUB(UTC_TIMESTAMP(),INTERVAL 90 DAY)"],
+      ["idempotency", "created_at<DATE_SUB(UTC_TIMESTAMP(),INTERVAL 7 DAY)"],
+      [
+        "component_evidence",
+        "updated_at<DATE_SUB(UTC_TIMESTAMP(),INTERVAL 7 DAY)",
+      ],
       [
         "deliveries",
         "updated_at<DATE_SUB(UTC_TIMESTAMP(),INTERVAL 30 DAY) AND status NOT IN ('pending','sending')",
@@ -242,15 +247,18 @@ export class Monitor {
   async mailCycle() {
     if (this.mailRunning) return this.mailRunning;
     this.mailRunning = this.store
-      .locked("lazycampus-status-mail-v1", () =>
-        deliverEmails(this.store, this.config),
-      )
-      .catch(() =>
+      .locked("lazycampus-status-mail-v1", async () => {
+        await deliverEmails(this.store, this.config);
+        this.lastMailRun = new Date().toISOString();
+        this.lastMailError = null;
+      })
+      .catch(() => {
+        this.lastMailError = "MAIL_WORKER_FAILED";
         this.logger.error(
           { event: "mail_worker_failed" },
           "Mail delivery could not complete",
-        ),
-      )
+        );
+      })
       .finally(() => {
         this.mailRunning = null;
       });

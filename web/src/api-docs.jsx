@@ -89,13 +89,30 @@ export function APIDocs({ navigate }) {
         </div>
         <p>
           默认每 30 秒探测一次，连续 3 次失败确认异常，连续 2
-          次成功确认恢复。可用率 = 正常运行时长 ÷
-          有效监测时长；性能下降与异常计为非正常，维护和未知时段不进入分母。新接入项目不会补造历史记录。
+          次成功确认恢复。可用率使用
+          availabilityPercentage，统计正常和性能下降时长；维护和未知不进入分母。coveragePercentage
+          单独表示覆盖率，uptimePercentage
+          保留完全正常运行比例。新接入项目不会补造历史记录。
         </p>
         <p>
           <code>stale: true</code> 表示监测数据更新延迟。请结合{" "}
           <code>updatedAt</code> 与组件的 <code>checkedAt</code>{" "}
           使用，避免将旧状态当成当前正常。
+        </p>
+      </section>
+      <section>
+        <h2>业务组件报告</h2>
+        <p>
+          组件 evidence 可包含最近 5 分钟的
+          requests、errors、limited、successPercentage、p95Ms 和
+          observedAt。预期的 4xx
+          不计为服务故障，限流单独统计；没有近期样本时显示未知。P95
+          在部分服务中使用耗时桶估算。
+        </p>
+        <p>
+          应用可选提供只读
+          /internal/monitoring/v1/state，由状态页携带独立凭据主动读取。关闭状态页不影响应用。管理端发布事件可携带
+          Idempotency-Key，重试复用相同键和请求体。
         </p>
       </section>
       <section>

@@ -1,5 +1,41 @@
 # 新项目接入规范
 
+## 可选组件报告
+
+应用可提供 `GET /internal/monitoring/v1/state`，由 Status 每 30 秒主动读取，无需应用发起请求。`STATUS_MONITOR_TOKEN` 默认不配置，集成关闭；启用时使用独立的至少 32 字符随机 Bearer 凭据，仅允许读监控报告。
+
+```json
+{
+  "version": 1,
+  "observedAt": "2026-09-11T12:00:00.000Z",
+  "components": {
+    "orders": {
+      "status": "operational",
+      "healthStatus": "operational",
+      "requests": 120,
+      "errors": 1,
+      "limited": 3,
+      "p95Ms": 250,
+      "windowSeconds": 300
+    }
+  }
+}
+```
+
+组件必须依据真实只读检查或已发生的业务请求。`healthStatus` 单独描述存储、会话、上游入口等只读检查结果，`status` 合并健康检查与调用异常，取较严重状态。Status 可调整流量阈值，但不会降低独立健康检查的故障等级；旧报告没有 `healthStatus` 时保留原有故障等级。
+
+`requests` 排除预期客户端 4xx，`errors` 是服务端失败，429 单独记为 `limited`。窗口为最近 5 分钟，Node.js 的 P95 使用固定耗时桶估算。零请求且只读检查通过时仍为 `operational`，请求数为 0，省略成功率和 P95，页面显示“暂无调用”。没有健康证据、查询失败或统计截断时不能当作零请求；返回 `no_data` 并省略不完整统计。未知和维护时段不计入可用率，也不补造接入前历史。
+
+Easy SWU 检查对应业务表、MySQL/Redis 和匿名教务、公告、电费入口；Identity Bridge 检查身份表、OIDC 会话表和学校认证入口；开放平台检查本地依赖与校园后端只读就绪接口。匿名入口检查不代表完整的学生登录或查询已成功，实际业务错误率仍独立参与判断。Node.js 的认证报告读取立即返回，后台并发探测在 8.5 秒内结束，15 秒内复用结果；首次结果尚未返回或健康结果超过 60 秒时报告未知。不会启动登录、切换 VPN、写入业务数据或发送邮件。
+
+GitOps 监测项配置 `kind: "http"`、`reportKey: "orders"`、`credentialRef` 和 `reportTTLSeconds: 100`。`STATUS_PROBE_CREDENTIALS` 将凭据引用绑定至唯一集群内部 URL；禁止跨地址发送凭据，不跟随重定向。每轮相同报告仅抓取一次，最大 64 KiB。版本不支持、组件缺失或报告过期均显示未知。
+
+公开 API 仅保留数字和时间，不透传任务详情、内部诊断或任意字段。`incidentGroup` 合并同一项目的异常；`dependencies` 为必要依赖，`optionalDependencies` 失败最多降级。`assetCheck: true` 只读检查 HTML 中最多两个同源 JS/CSS 资源。
+
+后台可覆盖检查间隔、超时、异常与恢复次数、耗时阈值；管理 API 还支持 `minRequests`、`degradedErrorPercentage`、`outageErrorPercentage`，默认为 20、5、50。少于最低样本量时，至少 3 个有效请求全部失败也会触发异常。GitOps 继续管理目标、凭据及组件归属。
+
+`availabilityPercentage` 统计正常和性能下降时长，兼容字段 `uptimePercentage` 仍统计完全正常时长。维护和未知时段不进入可用率分母，`coveragePercentage` 单列监测覆盖。新组件从上线后积累历史。
+
 ## 通过 GitOps 接入
 
 在状态服务的监测清单中增加项目和服务。只配置只读健康检查，不能使用会触发同步、产生订单、发送消息或消耗用户额度的业务接口。

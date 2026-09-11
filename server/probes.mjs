@@ -2,6 +2,7 @@ import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import dns from "node:dns";
+import { interpretReport } from "./evidence.mjs";
 
 export function allowedHost(host, allowlist) {
   const normalized = host.toLowerCase().replace(/\.$/, "");
@@ -134,7 +135,12 @@ export function request(
     req.end();
   });
 }
-export async function probe(component, allowlist, now = new Date()) {
+export async function probe(
+  component,
+  allowlist,
+  now = new Date(),
+  context = {},
+) {
   if (component.paused) return { status: "maintenance", reason: "监测已暂停" };
   if (component.kind === "heartbeat") {
     if (!component.heartbeatAt)
@@ -171,9 +177,28 @@ export async function probe(component, allowlist, now = new Date()) {
       });
       result = { status: "operational", reason: "TCP 连接成功" };
     } else {
-      const response = await request(component.target, {
-        timeout: (component.timeoutSeconds || 5) * 1000,
-      });
+      const headers = {};
+      if (component.credentialRef) {
+        const credential = context.credentials?.[component.credentialRef];
+        if (
+          !credential?.token ||
+          credential.target !== component.target ||
+          !new URL(component.target).hostname.endsWith(".svc.cluster.local")
+        )
+          return { status: "no_data", reason: "内部报告凭据未配置" };
+        headers.authorization = `Bearer ${credential.token}`;
+      }
+      const key = `${component.target}:${component.credentialRef || ""}:${component.assetCheck || false}`;
+      let pending = context.cache?.get(key);
+      if (!pending) {
+        pending = request(component.target, {
+          timeout: (component.timeoutSeconds || 5) * 1000,
+          limit: component.assetCheck ? 524288 : 65536,
+          headers,
+        });
+        context.cache?.set(key, pending);
+      }
+      const response = await pending;
       const codeOK = (component.expectedCodes || [200]).includes(
         response.status,
       );
@@ -187,9 +212,63 @@ export async function probe(component, allowlist, now = new Date()) {
             ? "响应内容不符合预期"
             : `HTTP ${response.status}`,
       };
+      if (codeOK && component.reportKey) {
+        result = response.truncated
+          ? { status: "no_data", reason: "业务报告超出长度限制" }
+          : interpretReport(
+              response.body,
+              component.reportKey,
+              now,
+              component.reportTTLSeconds || 100,
+              component,
+            );
+      }
+      if (
+        component.reportKey &&
+        !codeOK &&
+        [401, 403, 404, 429].includes(response.status)
+      ) {
+        result = {
+          status: "no_data",
+          reason: `业务报告不可读取（HTTP ${response.status}）`,
+        };
+      }
+      if (codeOK && component.assetCheck) {
+        const target = new URL(component.target);
+        const assets = [
+          ...response.body.matchAll(
+            /<(?:script|link)\b[^>]*(?:src|href)=["']([^"']+\.(?:js|css)(?:\?[^"']*)?)["']/gi,
+          ),
+        ]
+          .map((m) => new URL(m[1].replaceAll("&amp;", "&"), target))
+          .filter(
+            (url) =>
+              url.origin === target.origin && !url.username && !url.password,
+          )
+          .slice(0, 2);
+        if (!assets.length)
+          result = {
+            status: "no_data",
+            reason: "页面未发现可检查的脚本或样式",
+          };
+        else {
+          const results = await Promise.all(
+            assets.map((url) => request(url, { timeout: 5000, limit: 1024 })),
+          );
+          result = results.every(
+            (r) =>
+              r.status === 200 &&
+              r.body.length &&
+              !String(r.headers["content-type"]).includes("text/html"),
+          )
+            ? { status: "operational", reason: "页面资源检查通过" }
+            : { status: "full_outage", reason: "页面资源不可用" };
+        }
+      }
     }
     result.latencyMs = Math.round(performance.now() - started);
     if (
+      !component.reportKey &&
       result.status === "operational" &&
       result.latencyMs > (component.degradedAfterMs || 3000)
     )

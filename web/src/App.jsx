@@ -28,7 +28,7 @@ const STATUS_META = {
   partial_outage: { label: "部分异常", color: "#f5785c" },
   full_outage: { label: "服务中断", color: "#f87171" },
   maintenance: { label: "维护中", color: "#818cf8" },
-  no_data: { label: "暂无数据", color: "#e4e4e7" },
+  no_data: { label: "状态未知", color: "#e4e4e7" },
 };
 
 function fallbackHistory() {
@@ -85,7 +85,7 @@ function statusClass(status) {
 
 function uptime(value) {
   return value === null || value === undefined
-    ? "暂无数据"
+    ? "暂无记录"
     : `${value}% 可用率`;
 }
 
@@ -133,44 +133,109 @@ const ComponentItem = memo(function ComponentItem({
             alt=""
           />
         </span>
-        <span>{uptime(component.uptimePercentage)}</span>
+        <span>
+          {uptime(
+            component.availabilityPercentage ?? component.uptimePercentage,
+          )}
+        </span>
       </button>
       <div className="component-uptime">
         <UptimeChart history={component.history} label={component.name} />
       </div>
-      {open ? (
-        <div className="component-detail">
-          <dl>
-            <div>
-              <dt>当前状态</dt>
-              <dd>{STATUS_META[component.status]?.label}</dd>
-            </div>
-            <div>
-              <dt>最近检查</dt>
-              <dd>{formatInstant(component.checkedAt)}</dd>
-            </div>
-            <div>
-              <dt>响应时间</dt>
-              <dd>
-                {component.latencyMs === null
-                  ? "暂无数据"
-                  : `${component.latencyMs} ms`}
-              </dd>
-            </div>
-          </dl>
-          {component.description ? <p>{component.description}</p> : null}
-          {component.url ? (
-            <a href={component.url} target="_blank" rel="noreferrer">
-              访问服务 ↗
-            </a>
-          ) : null}
-          {incidents
-            .filter((i) => i.componentIds.includes(component.id))
-            .map((i) => (
-              <IncidentCard key={i.id} incident={i} navigate={navigate} />
-            ))}
+      <div
+        className={
+          open
+            ? "component-detail-reveal component-detail-reveal--open"
+            : "component-detail-reveal"
+        }
+        aria-hidden={!open}
+        inert={!open}
+      >
+        <div className="component-detail-reveal__inner">
+          <div className="component-detail">
+            <dl>
+              <div>
+                <dt>当前状态</dt>
+                <dd>{STATUS_META[component.status]?.label}</dd>
+              </div>
+              <div>
+                <dt>最近检查</dt>
+                <dd>{formatInstant(component.checkedAt)}</dd>
+              </div>
+              <div>
+                <dt>
+                  {component.kind === "business" ? "检查耗时" : "响应时间"}
+                </dt>
+                <dd>
+                  {component.latencyMs == null
+                    ? "暂无数据"
+                    : `${component.latencyMs} ms`}
+                </dd>
+              </div>
+              <div>
+                <dt>90 天可用率</dt>
+                <dd>{uptime(component.availabilityPercentage)}</dd>
+              </div>
+              <div>
+                <dt>监测覆盖率</dt>
+                <dd>{component.coveragePercentage ?? 0}%</dd>
+              </div>
+              {component.latencyCompliancePercentage != null ? (
+                <div>
+                  <dt>24 小时响应达标</dt>
+                  <dd>{component.latencyCompliancePercentage}%</dd>
+                </div>
+              ) : null}
+              {component.evidence?.requests !== undefined ? (
+                <>
+                  <div>
+                    <dt>
+                      最近 {Math.round(component.evidence.windowSeconds / 60)}{" "}
+                      分钟请求
+                    </dt>
+                    <dd>{component.evidence.requests}</dd>
+                  </div>
+                  <div>
+                    <dt>成功率</dt>
+                    <dd>
+                      {component.evidence.successPercentage === undefined
+                        ? component.evidence.requests === 0
+                          ? "暂无调用"
+                          : "暂无数据"
+                        : `${component.evidence.successPercentage.toFixed(2)}%`}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>限流次数</dt>
+                    <dd>{component.evidence.limited ?? 0}</dd>
+                  </div>
+                  <div>
+                    <dt>P95 耗时</dt>
+                    <dd>
+                      {component.evidence.p95Ms === undefined
+                        ? component.evidence.requests === 0
+                          ? "暂无调用"
+                          : "暂无数据"
+                        : `${component.evidence.p95Ms} ms`}
+                    </dd>
+                  </div>
+                </>
+              ) : null}
+            </dl>
+            {component.description ? <p>{component.description}</p> : null}
+            {component.url ? (
+              <a href={component.url} target="_blank" rel="noreferrer">
+                访问服务 ↗
+              </a>
+            ) : null}
+            {incidents
+              .filter((i) => i.componentIds.includes(component.id))
+              .map((i) => (
+                <IncidentCard key={i.id} incident={i} navigate={navigate} />
+              ))}
+          </div>
         </div>
-      ) : null}
+      </div>
     </div>
   );
 });
@@ -179,7 +244,7 @@ function StatusIcon({ status = "operational" }) {
   return (
     <span
       role="img"
-      aria-label={STATUS_META[status]?.label || "暂无数据"}
+      aria-label={STATUS_META[status]?.label || "状态未知"}
       className={`status-icon ${statusClass(status)}`}
     />
   );
@@ -224,7 +289,7 @@ const UptimeChart = memo(function UptimeChart({ history, label }) {
             aria-describedby={
               tooltip?.item.date === item.date ? tooltipId : undefined
             }
-            aria-label={`${item.label}: ${STATUS_META[item.status]?.label || item.status}`}
+            aria-label={`${item.label}: ${item.status === "no_data" ? "暂无记录" : STATUS_META[item.status]?.label || item.status}`}
             className={`uptime-pill ${statusClass(item.status)}`}
             key={item.date}
             tabIndex={index === 0 ? 0 : -1}
@@ -273,8 +338,8 @@ const UptimeChart = memo(function UptimeChart({ history, label }) {
                     background: STATUS_META[tooltip.item.status]?.color,
                   }}
                 />
-                {tooltip.item.status === "operational"
-                  ? "正常运行"
+                {tooltip.item.status === "no_data"
+                  ? "暂无记录"
                   : STATUS_META[tooltip.item.status]?.label}
               </span>
               {tooltip.item.coveragePercentage !== undefined ? (
@@ -342,7 +407,7 @@ const StatusGroup = memo(function StatusGroup({ group, incidents, navigate }) {
           aria-hidden={open}
           className={open ? "uptime-copy uptime-copy--hidden" : "uptime-copy"}
         >
-          {uptime(group.uptimePercentage)}
+          {uptime(group.availabilityPercentage ?? group.uptimePercentage)}
         </span>
       </button>
       <div

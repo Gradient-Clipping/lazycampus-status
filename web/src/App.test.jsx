@@ -82,7 +82,7 @@ const snapshot = {
   title: "LaZy Campus",
   overallStatus: "operational",
   headline: "所有服务正常运行",
-  message: "所有已纳入监测的服务运行正常。",
+  message: "所有服务运行正常。",
   range: { start: "2026-06-14", end: "2026-09-11" },
   updatedAt: "2026-09-11T08:00:00Z",
   subscriptionsEnabled: false,
@@ -125,6 +125,33 @@ function mock() {
   );
   vi.spyOn(window, "scrollTo").mockImplementation(() => {});
 }
+test("idle services show no calls without inventing success rates or historical availability", async () => {
+  const current = structuredClone(snapshot);
+  current.updatedAt = new Date().toISOString();
+  const component = current.groups[0].components[0];
+  component.uptimePercentage = null;
+  component.evidence = {
+    requests: 0,
+    errors: 0,
+    limited: 2,
+    windowSeconds: 300,
+  };
+  component.history = [{ date: "2026-09-11", status: "no_data" }];
+  writePublicCache("status", getDeviceTimeZone(), current);
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => new Promise(() => {})),
+  );
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: /Smart Shop/ }));
+  fireEvent.click(screen.getByRole("button", { name: /业务 API/ }));
+  const details = document.querySelector(".component-detail");
+  expect(within(details).getAllByText("暂无调用").length).toBe(2);
+  expect(within(details).queryByText("100.00%")).toBeNull();
+  expect(within(details).getByText("正常运行")).toBeTruthy();
+  expect(within(details).getByText("暂无记录")).toBeTruthy();
+  expect(screen.getByRole("button", { name: /2026.*暂无记录/ })).toBeTruthy();
+});
 test("projects and service details expand independently and preserve the original status anatomy", async () => {
   mock();
   render(<App />);

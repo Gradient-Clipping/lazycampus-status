@@ -44,6 +44,18 @@ const componentProperties = {
   },
   contains: { type: "string", maxLength: 200 },
   dependencies: { ...idsSchema, minItems: 0 },
+  optionalDependencies: { ...idsSchema, minItems: 0 },
+  reportKey: {
+    type: "string",
+    minLength: 1,
+    maxLength: 80,
+    pattern: "^[a-zA-Z0-9_-]+$",
+  },
+  reportTTLSeconds: { type: "integer", minimum: 30, maximum: 3600 },
+  assetCheck: { type: "boolean" },
+  minRequests: { type: "integer", minimum: 1, maximum: 10000 },
+  degradedErrorPercentage: { type: "number", minimum: 0.1, maximum: 100 },
+  outageErrorPercentage: { type: "number", minimum: 0.1, maximum: 100 },
 };
 const phases = [
   "investigating",
@@ -84,6 +96,10 @@ export async function installAPI(app, store, config, snapshots, monitor) {
         throw failure("INVALID_COMPONENT", "所选组件不存在");
   }
   async function validateComponent(spec) {
+    if (
+      (spec.degradedErrorPercentage || 5) > (spec.outageErrorPercentage || 50)
+    )
+      throw failure("INVALID_THRESHOLD", "严重异常阈值不能低于性能下降阈值");
     try {
       validateTarget(spec, config.probeHosts);
     } catch (error) {
@@ -98,7 +114,10 @@ export async function installAPI(app, store, config, snapshots, monitor) {
       )
         throw failure("INVALID_URL", "公开链接必须为 HTTP(S) 地址");
     }
-    await known(spec.dependencies || []);
+    await known([
+      ...(spec.dependencies || []),
+      ...(spec.optionalDependencies || []),
+    ]);
     const all = await store.components(),
       byId = new Map(all.map((c) => [c.id, c]));
     byId.set(spec.id, spec);
@@ -106,7 +125,11 @@ export async function installAPI(app, store, config, snapshots, monitor) {
       if (stack.has(id))
         throw failure("CYCLIC_DEPENDENCY", "关联服务不能形成循环");
       const next = new Set(stack).add(id);
-      for (const dep of byId.get(id)?.dependencies || []) walk(dep, next);
+      for (const dep of [
+        ...(byId.get(id)?.dependencies || []),
+        ...(byId.get(id)?.optionalDependencies || []),
+      ])
+        walk(dep, next);
     }
     walk(spec.id, new Set());
   }
@@ -257,6 +280,12 @@ export async function installAPI(app, store, config, snapshots, monitor) {
       lastRun: monitor.lastRun,
       lastClusterSuccess: monitor.lastClusterSuccess,
       storageError: snapshots.lastError,
+      cycleDurationMs: monitor.cycleDurationMs,
+      lastMailRun: monitor.lastMailRun,
+      lastMailError: monitor.lastMailError,
+      attention: await store.query(
+        "SELECT status,error_code,COUNT(*) AS count,MIN(updated_at) AS oldest FROM deliveries WHERE status IN ('failed','uncertain') OR (status IN ('pending','sending') AND updated_at<DATE_SUB(UTC_TIMESTAMP(),INTERVAL 10 MINUTE)) GROUP BY status,error_code",
+      ),
       components: await store.components(),
       incidents: (
         await store.query(
@@ -386,6 +415,15 @@ export async function installAPI(app, store, config, snapshots, monitor) {
               "group",
               "groupName",
               "publicUrl",
+              "intervalSeconds",
+              "timeoutSeconds",
+              "failureThreshold",
+              "recoveryThreshold",
+              "degradedAfterMs",
+              "reportTTLSeconds",
+              "minRequests",
+              "degradedErrorPercentage",
+              "outageErrorPercentage",
             ].includes(k),
         )
       )
@@ -393,6 +431,10 @@ export async function installAPI(app, store, config, snapshots, monitor) {
       if (archived && previous.source !== "manual")
         throw failure("MANAGED_COMPONENT", "自动发现的组件请在 GitOps 中排除");
       const spec = { ...previous, ...patch };
+      if (
+        (spec.degradedErrorPercentage || 5) > (spec.outageErrorPercentage || 50)
+      )
+        throw failure("INVALID_THRESHOLD", "严重异常阈值不能低于性能下降阈值");
       if (previous.source === "manual") await validateComponent(spec);
       const result = await store.query(
         "UPDATE components SET overrides=JSON_MERGE_PATCH(overrides,CAST(? AS JSON)),archived=?,version=version+1,updated_at=UTC_TIMESTAMP(3) WHERE id=? AND version=?",
@@ -420,6 +462,17 @@ export async function installAPI(app, store, config, snapshots, monitor) {
     {
       tags: ["管理"],
       summary: "发布故障或计划维护",
+      headers: {
+        type: "object",
+        properties: {
+          "idempotency-key": {
+            type: "string",
+            minLength: 8,
+            maxLength: 128,
+            pattern: "^[A-Za-z0-9._:-]+$",
+          },
+        },
+      },
       body: {
         type: "object",
         additionalProperties: false,
@@ -460,10 +513,36 @@ export async function installAPI(app, store, config, snapshots, monitor) {
         );
       if (!maintenance && (body.scheduledStart || body.scheduledEnd))
         throw failure("INVALID_SCHEDULE", "只有维护事件可以设置计划时间");
-      const id = randomUUID(),
-        at = sqlDate(new Date()),
+      let id = randomUUID();
+      const at = sqlDate(new Date()),
         phase = maintenance ? "scheduled" : "investigating";
       await store.transaction(async (db) => {
+        if (req.headers["idempotency-key"]) {
+          const key = hash(
+            req.actor + ":incident:" + req.headers["idempotency-key"],
+          );
+          const fingerprint = hash(JSON.stringify(body));
+          await store.query(
+            "INSERT IGNORE INTO idempotency (id,fingerprint,resource_id,created_at) VALUES (?,?,?,?)",
+            [key, fingerprint, id, at],
+            db,
+          );
+          const [entry] = await store.query(
+            "SELECT * FROM idempotency WHERE id=? FOR UPDATE",
+            [key],
+            db,
+          );
+          if (entry.fingerprint !== fingerprint)
+            throw failure(
+              "IDEMPOTENCY_CONFLICT",
+              "此幂等键已用于不同内容",
+              409,
+            );
+          if (entry.resource_id !== id) {
+            id = entry.resource_id;
+            return;
+          }
+        }
         await store.query(
           "INSERT INTO incidents (id,title,message,component_ids,severity,phase,source,started_at,updated_at,scheduled_start,scheduled_end) VALUES (?,?,?,?,?,?,'manual',?,?,?,?)",
           [

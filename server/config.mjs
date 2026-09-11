@@ -18,6 +18,7 @@ export function settings(env = process.env) {
     staleAfter: 100000,
     historyDays: 90,
     adminToken: env.STATUS_ADMIN_TOKEN || "",
+    probeCredentials: JSON.parse(env.STATUS_PROBE_CREDENTIALS || "{}"),
     issuer: env.OIDC_ISSUER || "",
     clientId: env.OIDC_CLIENT_ID || "lazycampus-status",
     clientSecret: env.OIDC_CLIENT_SECRET || "",

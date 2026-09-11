@@ -16,6 +16,13 @@ export const sqlDate = (value) =>
   new Date(value).toISOString().slice(0, 23).replace("T", " ");
 
 const migrations = [
+  `CREATE TABLE IF NOT EXISTS component_evidence (
+    component_id VARCHAR(160) PRIMARY KEY, payload JSON NOT NULL, updated_at DATETIME(3) NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS idempotency (
+    id CHAR(64) PRIMARY KEY, fingerprint CHAR(64) NOT NULL, resource_id VARCHAR(64) NOT NULL,
+    created_at DATETIME(3) NOT NULL, INDEX(created_at)
+  )`,
   `CREATE TABLE IF NOT EXISTS components (
     id VARCHAR(160) PRIMARY KEY, spec JSON NOT NULL, overrides JSON NOT NULL,
     source VARCHAR(24) NOT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL,

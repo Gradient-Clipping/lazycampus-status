@@ -66,6 +66,11 @@ export async function recordObservation(store, id, result, now = new Date()) {
     const state = nextState(previous, result, now);
     const at = sqlDate(now);
     await store.query(
+      "INSERT INTO component_evidence (component_id,payload,updated_at) VALUES (?,?,?) ON DUPLICATE KEY UPDATE payload=VALUES(payload),updated_at=VALUES(updated_at)",
+      [id, JSON.stringify(result.evidence || null), at],
+      db,
+    );
+    await store.query(
       "UPDATE components SET status=?,raw_status=?,streak=?,checked_at=?,latency_ms=?,reason=? WHERE id=?",
       [
         state.status,
@@ -114,6 +119,7 @@ export async function recordObservation(store, id, result, now = new Date()) {
         db,
       );
     }
+    if (previous.incidentGroup) return state;
     if (failed(state.status)) {
       const [incident] = await store.query(
         "SELECT id FROM incidents WHERE automatic_key=?",
@@ -172,6 +178,105 @@ export async function recordObservation(store, id, result, now = new Date()) {
     }
     return state;
   });
+}
+export async function reconcileGroupedIncidents(store, now = new Date()) {
+  const components = await store.components();
+  const groups = [
+    ...new Set(
+      components.filter((c) => c.incidentGroup).map((c) => c.incidentGroup),
+    ),
+  ];
+  for (const group of groups)
+    await store.transaction(async (db) => {
+      const members = components.filter((c) => c.incidentGroup === group);
+      const affected = members.filter((c) => failed(effectiveStatus(c, now)));
+      const key = `group:${group}`;
+      const [existing] = await store.query(
+        "SELECT * FROM incidents WHERE automatic_key=? FOR UPDATE",
+        [key],
+        db,
+      );
+      const at = sqlDate(now);
+      if (affected.length) {
+        const ids = affected.map((c) => c.id).sort();
+        const severity =
+          affected.length === members.length &&
+          affected.every((c) => c.status === "full_outage")
+            ? "full_outage"
+            : affected.some((c) =>
+                  ["partial_outage", "full_outage"].includes(c.status),
+                )
+              ? "partial_outage"
+              : "degraded_performance";
+        if (!existing) {
+          const id = randomUUID();
+          await store.query(
+            "INSERT INTO incidents (id,title,message,component_ids,severity,phase,source,automatic_key,started_at,updated_at) VALUES (?,?,?,?,?,'investigating','monitor',?,?,?)",
+            [
+              id,
+              `${members[0].groupName || group} 服务异常`,
+              "部分服务受到影响，正在确认。",
+              JSON.stringify(ids),
+              severity,
+              key,
+              at,
+              at,
+            ],
+            db,
+          );
+          await appendUpdate(
+            store,
+            db,
+            id,
+            "investigating",
+            "部分服务受到影响，正在确认。",
+            at,
+          );
+        } else {
+          // Keep the full impact set throughout the incident, including recovered
+          // members, so scoped subscribers also receive its eventual resolution.
+          const allIds = [
+            ...new Set([...json(existing.component_ids), ...ids]),
+          ].sort();
+          if (
+            JSON.stringify(allIds) !==
+              JSON.stringify(json(existing.component_ids).sort()) ||
+            severity !== existing.severity
+          ) {
+            await store.query(
+              "UPDATE incidents SET component_ids=?,severity=?,updated_at=?,version=version+1 WHERE id=?",
+              [JSON.stringify(allIds), severity, at, existing.id],
+              db,
+            );
+            await appendUpdate(
+              store,
+              db,
+              existing.id,
+              existing.phase,
+              "服务影响范围已更新。",
+              at,
+            );
+          }
+        }
+      } else if (
+        existing &&
+        members.every((c) => effectiveStatus(c, now) === "operational")
+      ) {
+        await store.query(
+          "UPDATE incidents SET phase='resolved',message='连续监测确认服务已恢复。',resolved_at=?,updated_at=?,automatic_key=NULL,version=version+1 WHERE id=?",
+          [at, at, existing.id],
+          db,
+        );
+        await appendUpdate(
+          store,
+          db,
+          existing.id,
+          "resolved",
+          "连续监测确认服务已恢复。",
+          at,
+        );
+      }
+    });
 }
 export async function appendUpdate(store, db, incidentId, phase, message, at) {
   const id = randomUUID();

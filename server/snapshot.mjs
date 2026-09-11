@@ -1,6 +1,7 @@
 import { iso } from "./store.mjs";
 import { failure } from "./auth.mjs";
 import { effectiveStatus, incidentFromRow, worst } from "./status.mjs";
+import { freshEvidence } from "./evidence.mjs";
 export function dateKey(value, timeZone) {
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat("en-CA", {
@@ -61,9 +62,11 @@ export function aggregateStatus(values) {
 }
 export function historyFor(periods, days) {
   let healthy = 0,
+    available = 0,
     observed = 0;
   const history = days.map((day) => {
     let good = 0,
+      up = 0,
       known = 0,
       maintenance = 0;
     const states = [];
@@ -78,9 +81,12 @@ export function historyFor(periods, days) {
       else if (period.status !== "no_data") {
         known += duration;
         if (period.status === "operational") good += duration;
+        if (["operational", "degraded_performance"].includes(period.status))
+          up += duration;
       }
     }
     healthy += good;
+    available += up;
     observed += known;
     return {
       date: day.key,
@@ -88,6 +94,7 @@ export function historyFor(periods, days) {
         ? worst(states.filter((status) => status !== "no_data"))
         : "no_data",
       uptimePercentage: known ? +((good / known) * 100).toFixed(3) : null,
+      availabilityPercentage: known ? +((up / known) * 100).toFixed(3) : null,
       observedSeconds: Math.round(known / 1000),
       maintenanceSeconds: Math.round(maintenance / 1000),
       coveragePercentage: +(
@@ -99,6 +106,17 @@ export function historyFor(periods, days) {
   return {
     history,
     uptimePercentage: observed ? ((healthy / observed) * 100).toFixed(3) : null,
+    availabilityPercentage: observed
+      ? ((available / observed) * 100).toFixed(3)
+      : null,
+    coveragePercentage: +(
+      (observed /
+        Math.max(
+          1,
+          days.reduce((sum, day) => sum + day.end - day.start, 0),
+        )) *
+      100
+    ).toFixed(2),
     observedSeconds: Math.round(observed / 1000),
   };
 }
@@ -141,21 +159,48 @@ export class SnapshotService {
   }
   async refresh() {
     try {
-      const [components, periods, incidents, updates] = await Promise.all([
-        this.store.components(),
-        this.store.query(
-          "SELECT component_id,status,started_at,ended_at FROM periods WHERE ended_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 91 DAY) ORDER BY started_at",
-        ),
-        this.store.query(
-          "SELECT * FROM incidents WHERE updated_at>=DATE_SUB(UTC_TIMESTAMP(),INTERVAL 91 DAY) OR phase NOT IN ('resolved','completed','cancelled') ORDER BY updated_at DESC LIMIT 1000",
-        ),
-        this.store.query(
-          "SELECT * FROM incident_updates WHERE created_at>=DATE_SUB(UTC_TIMESTAMP(),INTERVAL 91 DAY) ORDER BY created_at DESC LIMIT 5000",
-        ),
-      ]);
+      const [components, periods, incidents, updates, evidence, latency] =
+        await Promise.all([
+          this.store.components(),
+          this.store.query(
+            "SELECT component_id,status,started_at,ended_at FROM periods WHERE ended_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 91 DAY) ORDER BY started_at",
+          ),
+          this.store.query(
+            "SELECT * FROM incidents WHERE updated_at>=DATE_SUB(UTC_TIMESTAMP(),INTERVAL 91 DAY) OR phase NOT IN ('resolved','completed','cancelled') ORDER BY updated_at DESC LIMIT 1000",
+          ),
+          this.store.query(
+            "SELECT * FROM incident_updates WHERE created_at>=DATE_SUB(UTC_TIMESTAMP(),INTERVAL 91 DAY) ORDER BY created_at DESC LIMIT 5000",
+          ),
+          this.store.query(
+            "SELECT component_id,payload FROM component_evidence",
+          ),
+          this.store.query(
+            "SELECT o.component_id,COUNT(*) samples,SUM(o.latency_ms<=CAST(COALESCE(JSON_EXTRACT(c.overrides,'$.degradedAfterMs'),JSON_EXTRACT(c.spec,'$.degradedAfterMs'),'3000') AS UNSIGNED)) compliant FROM observations o JOIN components c ON c.id=o.component_id WHERE o.checked_at>=DATE_SUB(UTC_TIMESTAMP(),INTERVAL 24 HOUR) AND o.latency_ms IS NOT NULL AND o.raw_status IN ('operational','degraded_performance') AND JSON_EXTRACT(c.spec,'$.reportKey') IS NULL GROUP BY o.component_id",
+          ),
+        ]);
       this.data = {
         components,
         periods,
+        latency: new Map(
+          latency.map((row) => [
+            row.component_id,
+            {
+              samples: Number(row.samples),
+              percentage: +(
+                (100 * Number(row.compliant)) /
+                Number(row.samples)
+              ).toFixed(2),
+            },
+          ]),
+        ),
+        evidence: new Map(
+          evidence.map((row) => [
+            row.component_id,
+            typeof row.payload === "string"
+              ? JSON.parse(row.payload)
+              : row.payload,
+          ]),
+        ),
         incidents: incidents.map((row) =>
           incidentFromRow(
             row,
@@ -246,8 +291,18 @@ export class SnapshotService {
         status,
         checkedAt: component.checkedAt,
         latencyMs: component.latencyMs,
-        kind: component.kind,
+        kind: component.reportKey ? "business" : component.kind,
+        latencyCompliancePercentage:
+          this.data.latency?.get(component.id)?.percentage ?? null,
         url: component.publicUrl || "",
+        evidence:
+          status === "no_data" || stale
+            ? null
+            : freshEvidence(
+                this.data.evidence?.get(component.id),
+                now,
+                component.reportTTLSeconds || 100,
+              ),
         ...historyFor(periods, days),
       });
       group.periods.push(periods);
@@ -275,7 +330,7 @@ export class SnapshotService {
       message: stale
         ? "正在重新连接监测服务；请留意各组件的最近检查时间。"
         : overallStatus === "operational"
-          ? "所有已纳入监测的服务运行正常。"
+          ? "所有服务运行正常。"
           : overallStatus === "degraded_performance"
             ? "部分服务响应时间较长。"
             : "展开项目查看各组件状态与故障进展。",

@@ -40,6 +40,22 @@ a:focus-visible {
   background: #fafafa;
   font-size: 13px;
 }
+.component-detail-reveal {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows 160ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 100ms ease-out;
+}
+.component-detail-reveal--open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.component-detail-reveal__inner {
+  min-height: 0;
+  overflow: hidden;
+}
 .component-detail dl,
 .admin-service-body dl {
   display: grid;
@@ -504,7 +520,8 @@ button.admin-service-title {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .detail-chevron {
+  .detail-chevron,
+  .component-detail-reveal {
     transition: none;
   }
 }
