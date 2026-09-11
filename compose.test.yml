@@ -7,7 +7,7 @@ services:
       MYSQL_USER: status_test
       MYSQL_PASSWORD: local-test-only-password
     ports:
-      - "127.0.0.1:3311:3306"
+      - "127.0.0.1:${STATUS_TEST_MYSQL_PORT:-3311}:3306"
     healthcheck:
       test:
         [

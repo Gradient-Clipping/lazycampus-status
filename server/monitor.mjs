@@ -4,7 +4,7 @@ import { probe, validateTarget } from "./probes.mjs";
 import {
   appendUpdate,
   effectiveStatus,
-  recordObservation,
+  recordObservations,
   reconcileGroupedIncidents,
 } from "./status.mjs";
 import { sqlDate } from "./store.mjs";
@@ -42,22 +42,19 @@ export class Monitor {
           cache: new Map(),
         };
         const groups = catalog.groups || [];
-        for (const spec of catalog.monitors) {
+        const configuredSpecs = catalog.monitors.map((spec) => {
           validateTarget(spec, this.config.probeHosts);
           const group = groups.find((g) => g.id === spec.group);
-          await this.store.upsert(
-            {
-              ...spec,
-              groupName: group?.name || spec.group,
-              groupOrder: Math.max(
-                0,
-                groups.findIndex((g) => g.id === spec.group),
-              ),
-            },
-            "config",
-            now,
-          );
-        }
+          return {
+            ...spec,
+            groupName: group?.name || spec.group,
+            groupOrder: Math.max(
+              0,
+              groups.findIndex((g) => g.id === spec.group),
+            ),
+          };
+        });
+        await this.store.upsertMany(configuredSpecs, "config", now);
         if (this.config.configFile) {
           const configured = new Set(catalog.monitors.map((c) => c.id));
           for (const component of await this.store.components()) {
@@ -76,36 +73,49 @@ export class Monitor {
           try {
             const items = await clusterSnapshot(this.config);
             const discovered = discover(items, groups, now);
+            await this.store.upsertMany(
+              discovered.map(({ component }) => component),
+              "kubernetes",
+              now,
+            );
+            const existing = await this.store.components();
+            const currentById = new Map(existing.map((c) => [c.id, c]));
+            const observations = [];
             for (const { component, result } of discovered) {
-              await this.store.upsert(component, "kubernetes", now);
-              const current = await this.store.component(component.id);
-              await recordObservation(
-                this.store,
-                component.id,
-                current.paused
+              const current = currentById.get(component.id);
+              if (!current || current.source !== "kubernetes") continue;
+              observations.push({
+                id: component.id,
+                result: current.paused
                   ? { status: "maintenance", reason: "监测已暂停" }
                   : result,
                 now,
-              );
+                seen: true,
+              });
             }
-            this.lastClusterSuccess = now.toISOString();
-            const existing = await this.store.components();
             const ids = new Set(discovered.map((d) => d.component.id));
+            const archived = [];
             for (const component of existing.filter(
               (c) => c.source === "kubernetes" && !ids.has(c.id),
             )) {
-              await recordObservation(
-                this.store,
-                component.id,
-                { status: "no_data", reason: "工作负载已移除或不再纳入发现" },
+              observations.push({
+                id: component.id,
+                result: {
+                  status: "no_data",
+                  reason: "工作负载已移除或不再纳入发现",
+                },
                 now,
-              );
+              });
               if (now - new Date(component.lastSeen) > 10 * 60 * 1000)
-                await this.store.query(
-                  "UPDATE components SET archived=TRUE WHERE id=?",
-                  [component.id],
-                );
+                archived.push(component.id);
             }
+            await recordObservations(this.store, observations);
+            if (archived.length)
+              await this.store.query(
+                "UPDATE components SET archived=TRUE WHERE id IN (?)",
+                [archived],
+              );
+            this.lastClusterSuccess = now.toISOString();
           } catch {
             this.logger.warn(
               { event: "cluster_discovery_failed" },
@@ -123,6 +133,7 @@ export class Monitor {
         );
         // A bounded pool avoids overlapping scheduled requests and uncontrolled fan-out.
         let next = 0;
+        const observations = [];
         await Promise.all(
           Array.from({ length: Math.min(4, manual.length) }, async () => {
             while (next < manual.length) {
@@ -149,15 +160,16 @@ export class Monitor {
                     : "no_data",
                 );
               }
-              await recordObservation(
-                this.store,
-                component.id,
+              observations.push({
+                id: component.id,
                 result,
-                new Date(),
-              );
+                now: new Date(),
+                seen: component.source === "config",
+              });
             }
           }),
         );
+        await recordObservations(this.store, observations);
         await reconcileGroupedIncidents(this.store);
         if (Date.now() - this.lastCleanup > 3600000) {
           await this.cleanup();
