@@ -163,7 +163,11 @@ export class SnapshotService {
         await Promise.all([
           this.store.components(),
           this.store.query(
-            "SELECT component_id,status,started_at,ended_at FROM periods WHERE ended_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 91 DAY) ORDER BY started_at",
+            `SELECT p.component_id,p.status,p.started_at,
+              IF(p.id=latest.id,GREATEST(p.ended_at,COALESCE(c.checked_at,p.ended_at)),p.ended_at) AS ended_at
+              FROM periods p JOIN components c ON c.id=p.component_id
+              JOIN (SELECT component_id,MAX(id) AS id FROM periods GROUP BY component_id) latest ON latest.component_id=p.component_id
+              WHERE p.ended_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 91 DAY) ORDER BY p.started_at`,
           ),
           this.store.query(
             "SELECT * FROM incidents WHERE updated_at>=DATE_SUB(UTC_TIMESTAMP(),INTERVAL 91 DAY) OR phase NOT IN ('resolved','completed','cancelled') ORDER BY updated_at DESC LIMIT 1000",

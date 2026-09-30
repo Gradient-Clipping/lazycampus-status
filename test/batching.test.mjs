@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
-import { Store } from "../server/store.mjs";
+import { Store, iso } from "../server/store.mjs";
 import { settings } from "../server/config.mjs";
 import { recordObservations } from "../server/status.mjs";
+import { SnapshotService } from "../server/snapshot.mjs";
 
 test(
   "batched monitoring preserves overrides, freshness, history and atomic rollback",
@@ -76,7 +77,7 @@ test(
         ]);
       });
       await t.test(
-        "normal cycles retain every observation with far fewer commits",
+        "normal cycles preserve transitions with far fewer commits",
         async () => {
           let transactions = 0;
           const original = store.transaction.bind(store);
@@ -154,6 +155,94 @@ test(
         },
       );
       await t.test(
+        "stable checks only refresh components while latency probes retain every sample",
+        async () => {
+          const ids = specs.map(({ id }) => id);
+          await recordObservations(
+            store,
+            specs.map(({ id }) => ({
+              id,
+              result: { status: "operational" },
+              now: new Date(+start + 240000),
+              seen: true,
+            })),
+          );
+          const observationCount = async () =>
+            Number(
+              (
+                await store.query(
+                  "SELECT COUNT(*) AS count FROM observations WHERE component_id IN (?)",
+                  [ids],
+                )
+              )[0].count,
+            );
+          const beforeCount = await observationCount();
+          const beforePeriods = await store.query(
+            "SELECT * FROM periods WHERE component_id IN (?) ORDER BY id",
+            [ids],
+          );
+          const counts = new Map();
+          const original = store.query.bind(store);
+          store.query = async (sql, args, db) => {
+            const rows = await original(sql, args, db);
+            if (rows.affectedRows)
+              counts.set(
+                sql.split(" ").slice(0, 3).join(" "),
+                (counts.get(sql.split(" ").slice(0, 3).join(" ")) || 0) +
+                  rows.affectedRows,
+              );
+            return rows;
+          };
+          const at = new Date(+start + 270000);
+          await recordObservations(
+            store,
+            specs.map(({ id }) => ({
+              id,
+              result: { status: "operational" },
+              now: at,
+              seen: true,
+            })),
+          );
+          assert.equal(await observationCount(), beforeCount);
+          assert.deepEqual(
+            await store.query(
+              "SELECT * FROM periods WHERE component_id IN (?) ORDER BY id",
+              [ids],
+            ),
+            beforePeriods,
+          );
+          assert.equal(
+            [...counts.values()].reduce((a, b) => a + b, 0),
+            specs.length,
+            "a stable non-latency cycle must write just one row per component",
+          );
+          assert.equal(
+            (await store.component(first)).checkedAt,
+            at.toISOString(),
+          );
+          const snapshots = new SnapshotService(store, config);
+          await snapshots.refresh();
+          const latest = snapshots.data.periods
+            .filter((p) => p.component_id === first)
+            .at(-1);
+          assert.equal(
+            Date.parse(iso(latest.ended_at)),
+            +at,
+            "open period coverage must include the latest check without an UPDATE",
+          );
+          for (const offset of [300000, 330000])
+            await recordObservations(store, [
+              {
+                id: first,
+                result: { status: "operational", latencyMs: 20 },
+                now: new Date(+start + offset),
+              },
+            ]);
+          assert.equal(await observationCount(), beforeCount + 2);
+          store.query = original;
+        },
+      );
+      await t.test(
         "failure rolls back all members of the same batch",
         async () => {
           const ids = specs.slice(0, 2).map(({ id }) => id);
@@ -186,6 +275,73 @@ test(
           assert.deepEqual(
             await Promise.all(ids.map((id) => store.component(id))),
             before,
+          );
+        },
+      );
+      await t.test(
+        "missing evidence clears the prior report and a restart gap stays uncovered",
+        async () => {
+          const reportTime = new Date(+start + 360000);
+          await recordObservations(store, [
+            {
+              id: first,
+              result: {
+                status: "operational",
+                evidence: {
+                  requests: 20,
+                  observedAt: reportTime.toISOString(),
+                },
+              },
+              now: reportTime,
+            },
+          ]);
+          assert.equal(
+            (
+              await store.query(
+                "SELECT payload FROM component_evidence WHERE component_id=?",
+                [first],
+              )
+            ).length,
+            1,
+          );
+          await recordObservations(store, [
+            {
+              id: first,
+              result: { status: "operational" },
+              now: new Date(+start + 390000),
+            },
+          ]);
+          assert.equal(
+            (
+              await store.query(
+                "SELECT payload FROM component_evidence WHERE component_id=?",
+                [first],
+              )
+            ).length,
+            0,
+          );
+          const afterGap = new Date(+start + 900000);
+          await recordObservations(store, [
+            { id: first, result: { status: "operational" }, now: afterGap },
+          ]);
+          const periods = await store.query(
+            "SELECT * FROM periods WHERE component_id=? ORDER BY id",
+            [first],
+          );
+          assert.equal(
+            Date.parse(iso(periods.at(-2).ended_at)),
+            +start + 390000,
+          );
+          assert.equal(Date.parse(iso(periods.at(-1).started_at)), +afterGap);
+          const snapshot = new SnapshotService(store, config);
+          await snapshot.refresh();
+          const last = snapshot.data.periods
+            .filter((p) => p.component_id === first)
+            .at(-1);
+          assert.equal(
+            Date.parse(iso(last.ended_at)),
+            +afterGap,
+            "an offline collector must not extend coverage to wall-clock time",
           );
         },
       );
