@@ -37,12 +37,14 @@ export function nextState(previous, result, now) {
     previous.checkedAt &&
     now - new Date(previous.checkedAt) <=
       Math.max(100000, (previous.intervalSeconds || 30) * 3000);
-  const streak =
+  const streak = Math.min(
+    Math.max(previous.failureThreshold || 3, previous.recoveryThreshold || 2),
     continuous &&
-    (previous.rawStatus === result.status ||
-      (failed(previous.rawStatus) && failed(result.status)))
+      (previous.rawStatus === result.status ||
+        (failed(previous.rawStatus) && failed(result.status)))
       ? previous.streak + 1
-      : 1;
+      : 1,
+  );
   const required = failed(result.status)
     ? previous.failureThreshold || 3
     : result.status === "operational" && failed(previous.status)
@@ -87,11 +89,18 @@ async function writeObservation(store, db, id, result, now, seen = false) {
   if (!previous || previous.archived) return;
   const state = nextState(previous, result, now);
   const at = sqlDate(now);
-  await store.query(
-    "INSERT INTO component_evidence (component_id,payload,updated_at) VALUES (?,?,?) ON DUPLICATE KEY UPDATE payload=VALUES(payload),updated_at=VALUES(updated_at)",
-    [id, JSON.stringify(result.evidence || null), at],
-    db,
-  );
+  if (result.evidence)
+    await store.query(
+      "INSERT INTO component_evidence (component_id,payload,updated_at) VALUES (?,?,?) ON DUPLICATE KEY UPDATE payload=VALUES(payload),updated_at=VALUES(updated_at)",
+      [id, JSON.stringify(result.evidence), at],
+      db,
+    );
+  else
+    await store.query(
+      "DELETE FROM component_evidence WHERE component_id=?",
+      [id],
+      db,
+    );
   await store.query(
     "UPDATE components SET status=?,raw_status=?,streak=?,checked_at=?,latency_ms=?,reason=?,last_seen=IF(?, ?, last_seen) WHERE id=?",
     [
@@ -107,34 +116,53 @@ async function writeObservation(store, db, id, result, now, seen = false) {
     ],
     db,
   );
-  await store.query(
-    "INSERT INTO observations (component_id,checked_at,status,raw_status,latency_ms,reason) VALUES (?,?,?,?,?,?)",
-    [
-      id,
-      at,
-      state.status,
-      result.status,
-      result.latencyMs ?? null,
-      (result.reason || "").slice(0, 255),
-    ],
-    db,
-  );
+  // Latency samples retain every probe for the compliance calculation. Checks
+  // without latency need a historical observation only on a state/reason change;
+  // the current component and its open period still advance on every check.
+  if (
+    result.latencyMs != null ||
+    !state.continuous ||
+    previous.status !== state.status ||
+    previous.rawStatus !== result.status ||
+    previous.reason !== (result.reason || "").slice(0, 255)
+  )
+    await store.query(
+      "INSERT INTO observations (component_id,checked_at,status,raw_status,latency_ms,reason) VALUES (?,?,?,?,?,?)",
+      [
+        id,
+        at,
+        state.status,
+        result.status,
+        result.latencyMs ?? null,
+        (result.reason || "").slice(0, 255),
+      ],
+      db,
+    );
   const [period] = await store.query(
     "SELECT * FROM periods WHERE component_id=? ORDER BY ended_at DESC,id DESC LIMIT 1",
     [id],
     db,
   );
   if (period && period.status === state.status && state.continuous) {
-    await store.query(
-      "UPDATE periods SET ended_at=? WHERE id=?",
-      [at, period.id],
-      db,
-    );
-  } else {
-    if (period && state.continuous)
+    // The snapshot derives the latest period's end from checked_at. A daily
+    // retention anchor keeps long-running periods eligible for historical reads
+    // without rewriting them for every successful check.
+    if (iso(period.ended_at).slice(0, 10) !== now.toISOString().slice(0, 10))
       await store.query(
         "UPDATE periods SET ended_at=? WHERE id=?",
         [at, period.id],
+        db,
+      );
+  } else {
+    if (period)
+      await store.query(
+        "UPDATE periods SET ended_at=? WHERE id=?",
+        [
+          state.continuous
+            ? at
+            : sqlDate(previous.checkedAt || iso(period.ended_at)),
+          period.id,
+        ],
         db,
       );
     await store.query(
