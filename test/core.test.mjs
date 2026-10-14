@@ -63,6 +63,49 @@ test("failure and recovery thresholds suppress flapping and stale checks never s
     "no_data",
   );
 });
+test("slow successes never pre-confirm an outage and varied successes recover it", () => {
+  const now = new Date("2026-10-14T08:00:00Z");
+  let previous = {
+    status: "degraded_performance",
+    rawStatus: "degraded_performance",
+    streak: 3,
+    checkedAt: now.toISOString(),
+  };
+  const advance = (status, index) => {
+    const at = new Date(+now + index * 30000);
+    const next = nextState(previous, { status }, at);
+    previous = { ...previous, ...next, rawStatus: status, checkedAt: at };
+    return next.status;
+  };
+  assert.equal(advance("full_outage", 1), "degraded_performance");
+  assert.equal(advance("degraded_performance", 2), "degraded_performance");
+  assert.equal(advance("full_outage", 3), "degraded_performance");
+  assert.equal(advance("full_outage", 4), "degraded_performance");
+  assert.equal(advance("full_outage", 5), "full_outage");
+  assert.equal(advance("degraded_performance", 6), "full_outage");
+  assert.equal(advance("operational", 7), "operational");
+});
+
+test("a partial outage remains available evidence of failure without borrowing slow probes", () => {
+  const now = new Date();
+  let previous = {
+    status: "operational",
+    rawStatus: "degraded_performance",
+    streak: 2,
+    checkedAt: now,
+  };
+  for (const [index, status] of [
+    "partial_outage",
+    "full_outage",
+    "partial_outage",
+  ].entries()) {
+    const at = new Date(+now + (index + 1) * 30000);
+    const next = nextState(previous, { status }, at);
+    assert.equal(next.status, index < 2 ? "operational" : "partial_outage");
+    previous = { ...previous, ...next, rawStatus: status, checkedAt: at };
+  }
+});
+
 test("unknown and maintenance do not inflate uptime; a group uses every component", () => {
   const periods = [
     { start: 0, end: 500, status: "operational" },

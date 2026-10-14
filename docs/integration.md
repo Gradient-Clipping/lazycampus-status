@@ -24,13 +24,15 @@
 
 组件必须依据真实只读检查或已发生的业务请求。`healthStatus` 单独描述存储、会话、上游入口等只读检查结果，`status` 合并健康检查与调用异常，取较严重状态。Status 可调整流量阈值，但不会降低独立健康检查的故障等级；旧报告没有 `healthStatus` 时保留原有故障等级。
 
-`requests` 排除预期客户端 4xx，`errors` 是服务端失败，429 单独记为 `limited`。窗口为最近 5 分钟，Node.js 的 P95 使用固定耗时桶估算。零请求且只读检查通过时仍为 `operational`，请求数为 0，省略成功率和 P95，页面显示“暂无调用”。没有健康证据、查询失败或统计截断时不能当作零请求；返回 `no_data` 并省略不完整统计。未知和维护时段不计入可用率，也不补造接入前历史。
+`requests` 排除预期客户端 4xx，`errors` 是服务端失败，429 单独记为 `limited`。窗口为最近 5 分钟，Node.js 的 P95 使用有界原始耗时样本计算 nearest-rank 分位数；每个 10 秒桶最多 4096 个样本，超限或样本不完整时省略 P95，不返回低估值。零请求且只读检查通过时仍为 `operational`，请求数为 0，省略成功率和 P95，页面显示“暂无调用”。没有健康证据、查询失败或统计截断时不能当作零请求；返回 `no_data` 并省略不完整统计。未知和维护时段不计入可用率，也不补造接入前历史。
 
 Easy SWU 检查对应业务表、MySQL/Redis 和匿名教务、公告、电费入口；Identity Bridge 检查身份表、OIDC 会话表和学校认证入口；开放平台检查本地依赖与校园后端只读就绪接口。匿名入口检查不代表完整的学生登录或查询已成功，实际业务错误率仍独立参与判断。Node.js 的认证报告读取立即返回，后台并发探测在 8.5 秒内结束，15 秒内复用结果；首次结果尚未返回或健康结果超过 60 秒时报告未知。不会启动登录、切换 VPN、写入业务数据或发送邮件。
 
 GitOps 监测项配置 `kind: "http"`、`reportKey: "orders"`、`credentialRef` 和 `reportTTLSeconds: 100`。`STATUS_PROBE_CREDENTIALS` 将凭据引用绑定至唯一集群内部 URL；禁止跨地址发送凭据，不跟随重定向。每轮相同报告仅抓取一次，最大 64 KiB。版本不支持、组件缺失或报告过期均显示未知。
 
-公开 API 仅保留数字和时间，不透传任务详情、内部诊断或任意字段。`incidentGroup` 合并同一项目的异常；`dependencies` 为必要依赖，`optionalDependencies` 失败最多降级。`assetCheck: true` 只读检查 HTML 中最多两个同源 JS/CSS 资源。
+公开 API 仅保留数字和时间，不透传任务详情、内部诊断或任意字段。`incidentGroup` 合并同一项目的异常；`dependencies` 为必要依赖，`optionalDependencies` 失败最多降级。`assetCheck: true` 只读检查 HTML 中最多两个同源 JS/CSS 资源；响应时间取 HTML 与资源请求中的最大值，不累加整轮运行时间。全部请求继承组件超时，HTTP/TLS 连接可复用，仍校验目标白名单与地址。
+
+业务报告默认使用 5000 ms 性能阈值，生产教务多步刷新请求独立使用 10000 ms；健康检查与真实请求错误仍独立判定。P95 表示后端完整业务请求耗时，不代表单次学校接口或 Tailscale 往返耗时。
 
 后台可覆盖检查间隔、超时、异常与恢复次数、耗时阈值；管理 API 还支持 `minRequests`、`degradedErrorPercentage`、`outageErrorPercentage`，默认为 20、5、50。少于最低样本量时，至少 3 个有效请求全部失败也会触发异常。GitOps 继续管理目标、凭据及组件归属。
 
