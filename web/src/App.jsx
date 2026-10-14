@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useId, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
+import { History } from "./history.jsx";
 import { Admin } from "./admin.jsx";
 import { Subscribe, Unsubscribe } from "./subscribe.jsx";
 import { APIDocs } from "./api-docs.jsx";
@@ -13,7 +14,6 @@ const statusPageLogoUrl = "/logo.webp";
 import {
   deviceDateKey,
   formatDeviceCalendarDate,
-  formatDeviceMonthName,
   formatDeviceMonthRange,
   offsetCalendarDateKey,
   previousMonthStartDateKey,
@@ -210,7 +210,7 @@ const ComponentItem = memo(function ComponentItem({
                     <dd>{component.evidence.limited ?? 0}</dd>
                   </div>
                   <div>
-                    <dt>P95 耗时</dt>
+                    <dt>接口总耗时 P95</dt>
                     <dd>
                       {component.evidence.p95Ms === undefined
                         ? component.evidence.requests === 0
@@ -517,49 +517,6 @@ function StatusOverview({ snapshot, navigate }) {
   );
 }
 
-function History({ data, navigate }) {
-  return (
-    <main className="history-page">
-      <div className="breadcrumbs">
-        <button onClick={() => navigate("/")} type="button">
-          LaZy Campus
-        </button>
-        <span>/</span>
-        <span>历史记录</span>
-      </div>
-      <div className="history-heading">
-        <h1>历史记录</h1>
-        <span className="date-range">{formatRange(data.range)}</span>
-      </div>
-      <div className="month-list">
-        {data.months.map((month) => {
-          return (
-            <section className="month-row" key={month.key}>
-              <h2>{formatDeviceMonthName(month.key)}</h2>
-              {month.incidents.length === 0 ? (
-                <p className="no-incidents">
-                  <StatusIcon />
-                  没有故障记录
-                </p>
-              ) : (
-                <div className="history-incidents">
-                  {month.incidents.map((incident) => (
-                    <IncidentCard
-                      key={incident.id}
-                      incident={incident}
-                      navigate={navigate}
-                    />
-                  ))}
-                </div>
-              )}
-            </section>
-          );
-        })}
-      </div>
-    </main>
-  );
-}
-
 function Header({ navigate, subscribe }) {
   return (
     <header className="site-header">
@@ -694,7 +651,11 @@ export function App() {
         ) : path.startsWith("/incidents/") ? (
           <IncidentDetail id={path.split("/")[2]} navigate={navigate} />
         ) : isHistory ? (
-          <History data={history} navigate={navigate} />
+          <History
+            data={history}
+            groups={snapshot.groups}
+            navigate={navigate}
+          />
         ) : (
           <StatusOverview navigate={navigate} snapshot={snapshot} />
         )}

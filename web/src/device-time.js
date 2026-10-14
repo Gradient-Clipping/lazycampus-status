@@ -160,6 +160,20 @@ export function formatInstant(value) {
     hourCycle: "h23",
   }).format(new Date(value));
 }
+export function formatDeviceWeekday(value) {
+  const timeZone = getDeviceTimeZone();
+  return dateFormatter("zh-CN", { weekday: "short", timeZone }).format(
+    deviceCalendarDateInstant(value, timeZone),
+  );
+}
+export function formatDeviceTime(value) {
+  return dateFormatter("zh-CN", {
+    timeZone: getDeviceTimeZone(),
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(new Date(value));
+}
 export function inputToInstant(value) {
   return new Date(value).toISOString();
 }

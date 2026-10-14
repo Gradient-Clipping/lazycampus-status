@@ -22,6 +22,10 @@ export const worst = (items) =>
     : "no_data";
 export const failed = (status) =>
   ["degraded_performance", "partial_outage", "full_outage"].includes(status);
+const unavailable = (status) =>
+  ["partial_outage", "full_outage"].includes(status);
+const available = (status) =>
+  ["operational", "degraded_performance"].includes(status);
 export function effectiveStatus(component, now, staleAfter = 100000) {
   if (component.paused) return "maintenance";
   if (
@@ -41,14 +45,23 @@ export function nextState(previous, result, now) {
     Math.max(previous.failureThreshold || 3, previous.recoveryThreshold || 2),
     continuous &&
       (previous.rawStatus === result.status ||
-        (failed(previous.rawStatus) && failed(result.status)))
+        (unavailable(previous.rawStatus) && unavailable(result.status)) ||
+        (unavailable(previous.status) &&
+          available(previous.rawStatus) &&
+          available(result.status)))
       ? previous.streak + 1
       : 1,
   );
-  const required = failed(result.status)
-    ? previous.failureThreshold || 3
-    : result.status === "operational" && failed(previous.status)
-      ? previous.recoveryThreshold || 2
+  // Successful but slow responses cannot pre-confirm an outage. Recovery from
+  // an outage requires consecutive available probes, even if their speed varies.
+  const recovering =
+    available(result.status) &&
+    failed(previous.status) &&
+    weights[result.status] < weights[previous.status];
+  const required = recovering
+    ? previous.recoveryThreshold || 2
+    : failed(result.status)
+      ? previous.failureThreshold || 3
       : 1;
   return {
     status:

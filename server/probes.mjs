@@ -3,6 +3,16 @@ import https from "node:https";
 import net from "node:net";
 import dns from "node:dns";
 import { interpretReport } from "./evidence.mjs";
+const agentOptions = {
+  keepAlive: true,
+  maxSockets: 4,
+  maxTotalSockets: 32,
+  maxFreeSockets: 1,
+  // Keep eligible connections across the 30/60-second probe schedules.
+  timeout: 90000,
+};
+const httpAgent = new http.Agent(agentOptions);
+const httpsAgent = new https.Agent(agentOptions);
 
 export function allowedHost(host, allowlist) {
   const normalized = host.toLowerCase().replace(/\.$/, "");
@@ -85,6 +95,7 @@ export function request(
   url,
   { timeout = 5000, limit = 65536, headers = {}, ca, trusted = false } = {},
 ) {
+  const started = performance.now();
   return new Promise((resolve, reject) => {
     const target = new URL(url);
     const req = (target.protocol === "https:" ? https : http).request(
@@ -95,7 +106,7 @@ export function request(
         ca,
         lookup: trusted ? undefined : checkedLookup,
         signal: AbortSignal.timeout(timeout),
-        agent: false,
+        agent: target.protocol === "https:" ? httpsAgent : httpAgent,
       },
       (response) => {
         const chunks = [];
@@ -112,6 +123,7 @@ export function request(
                 body: Buffer.concat(chunks).toString("utf8"),
                 headers: response.headers,
                 truncated: true,
+                latencyMs: Math.round(performance.now() - started),
               });
               response.destroy();
               return;
@@ -127,6 +139,7 @@ export function request(
             status: response.statusCode,
             body: Buffer.concat(chunks).toString("utf8"),
             headers: response.headers,
+            latencyMs: Math.round(performance.now() - started),
           }),
         );
       },
@@ -154,6 +167,7 @@ export async function probe(
         };
   }
   const started = performance.now();
+  const fetch = context.request || request;
   try {
     validateTarget(component, allowlist);
     let result;
@@ -191,7 +205,7 @@ export async function probe(
       const key = `${component.target}:${component.credentialRef || ""}:${component.assetCheck || false}`;
       let pending = context.cache?.get(key);
       if (!pending) {
-        pending = request(component.target, {
+        pending = fetch(component.target, {
           timeout: (component.timeoutSeconds || 5) * 1000,
           limit: component.assetCheck ? 524288 : 65536,
           headers,
@@ -199,6 +213,7 @@ export async function probe(
         context.cache?.set(key, pending);
       }
       const response = await pending;
+      let latencyMs = response.latencyMs;
       const codeOK = (component.expectedCodes || [200]).includes(
         response.status,
       );
@@ -253,7 +268,18 @@ export async function probe(
           };
         else {
           const results = await Promise.all(
-            assets.map((url) => request(url, { timeout: 5000, limit: 1024 })),
+            assets.map((url) =>
+              fetch(url, {
+                timeout: (component.timeoutSeconds || 5) * 1000,
+                limit: 1024,
+              }),
+            ),
+          );
+          // The HTML and assets are separate requests. Compare the slowest
+          // request with the per-request budget, not their accumulated runtime.
+          latencyMs = Math.max(
+            latencyMs || 0,
+            ...results.map((r) => r.latencyMs || 0),
           );
           result = results.every(
             (r) =>
@@ -265,8 +291,9 @@ export async function probe(
             : { status: "full_outage", reason: "页面资源不可用" };
         }
       }
+      result.latencyMs = latencyMs;
     }
-    result.latencyMs = Math.round(performance.now() - started);
+    result.latencyMs ??= Math.round(performance.now() - started);
     if (
       !component.reportKey &&
       result.status === "operational" &&

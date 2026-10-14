@@ -79,17 +79,35 @@ export function interpretReport(body, key, now, ttl = 100, policy = {}) {
       : percent >= (policy.outageErrorPercentage || 50)
         ? "partial_outage"
         : percent >= (policy.degradedErrorPercentage || 5) ||
-            item.p95Ms > (policy.degradedAfterMs || 3000)
+            item.p95Ms >= (policy.degradedAfterMs || 5000)
           ? "degraded_performance"
           : "operational";
   }
   // Runtime traffic thresholds must never erase an independent readiness failure.
   status = worst([status, item.healthStatus ?? item.status]);
+  const reason =
+    status === "no_data"
+      ? "业务组件状态待确认"
+      : failedHealth(item.healthStatus ?? item.status)
+        ? "业务健康检查未通过"
+        : status === "partial_outage"
+          ? "近期请求错误率超过异常阈值"
+          : status === "degraded_performance"
+            ? item.errors / item.requests >=
+              (policy.degradedErrorPercentage || 5) / 100
+              ? "近期请求错误率超过性能阈值"
+              : "近期接口总耗时 P95 超过性能阈值"
+            : "业务组件检查完成";
   return {
     status,
-    reason: status === "no_data" ? "业务组件状态待确认" : "业务组件检查完成",
+    reason,
     evidence: publicEvidence({ ...item, observedAt: report.observedAt }),
   };
+}
+function failedHealth(status) {
+  return ["degraded_performance", "partial_outage", "full_outage"].includes(
+    status,
+  );
 }
 
 export function dependencyResult(component, result, byId, statusOf) {

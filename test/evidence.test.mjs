@@ -84,6 +84,96 @@ test("idle traffic, unknown evidence and independent health failures remain dist
     0,
   );
 });
+test("business latency budgets distinguish normal refreshes from sustained slowness", () => {
+  const now = new Date();
+  const report = (p95Ms, healthStatus = "operational", errors = 0) =>
+    JSON.stringify({
+      version: 1,
+      observedAt: now.toISOString(),
+      components: {
+        teaching: {
+          status: "degraded_performance",
+          healthStatus,
+          requests: 123,
+          errors,
+          p95Ms,
+        },
+      },
+    });
+  const interpret = (body, policy = {}) =>
+    interpretReport(body, "teaching", now, 100, policy);
+  assert.equal(interpret(report(3892)).status, "operational");
+  assert.equal(interpret(report(6000)).status, "degraded_performance");
+  assert.equal(
+    interpret(report(6000), { degradedAfterMs: 10000 }).status,
+    "operational",
+  );
+  assert.equal(
+    interpret(report(10000), { degradedAfterMs: 10000 }).status,
+    "degraded_performance",
+  );
+  assert.equal(
+    interpret(report(3892, "full_outage"), { degradedAfterMs: 10000 }).status,
+    "full_outage",
+  );
+  assert.equal(
+    interpret(report(100, "operational", 62)).status,
+    "partial_outage",
+  );
+});
+
+test("resource performance uses the slowest request and honors the configured timeout", async () => {
+  const calls = [];
+  const request = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return String(url).endsWith("/")
+      ? {
+          status: 200,
+          latencyMs: 2000,
+          body: '<script src="/app.js"></script><link href="/app.css">',
+          headers: {},
+        }
+      : {
+          status: 200,
+          latencyMs: 2900,
+          body: "asset",
+          headers: { "content-type": "text/css" },
+        };
+  };
+  const result = await probe(
+    {
+      kind: "http",
+      target: "https://example.test/",
+      assetCheck: true,
+      timeoutSeconds: 12,
+    },
+    ["example.test"],
+    new Date(),
+    { request, cache: new Map() },
+  );
+  assert.equal(result.status, "operational");
+  assert.equal(result.latencyMs, 2900);
+  assert.equal(calls.length, 3);
+  assert(calls.every(({ options }) => options.timeout === 12000));
+});
+
+test("cached business reports retain the original request latency for every component", async () => {
+  const target = "https://example.test/report";
+  const cache = new Map([
+    [
+      target + "::false",
+      Promise.resolve({ status: 200, latencyMs: 230, body: "ok", headers: {} }),
+    ],
+  ]);
+  const result = await probe(
+    { kind: "http", target },
+    ["example.test"],
+    new Date(),
+    { cache },
+  );
+  assert.equal(result.latencyMs, 230);
+});
+
 test("probe credentials are never forwarded to a different URL", async () => {
   const result = await probe(
     {
